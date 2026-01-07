@@ -1,0 +1,14 @@
+<launch>
+
+    <arg name="rviz" default="false"/>
+
+    <node pkg="limoncello" type="limoncello" name="limoncello" output="screen" >
+        <rosparam file="$(find limoncello)/config/livox.yaml" />
+    </node>
+
+    <!-- 静态 TF: odom_2D -> limoncello_odom (与 odom_2D 对齐) -->
+    <node pkg="tf" type="static_transform_publisher" name="tf_odom2d_limoncello" 
+          args="0 0 0 0 0 0 odom_2D limoncello_odom 100" />
+
+    <node pkg="rviz" name="rviz_limo" type="rviz" args="-d $(find limoncello)/config/rviz/limo.rviz" if="$(arg rviz)"/>
+</launch>
