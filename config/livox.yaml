@@ -37,12 +37,12 @@ sensors:
     base_frame: "base_link"               
 
     imu2baselink:
-      t: [0.0, 0.0, 0.0]  # (x, y, z) [meters]
-      R: [0.0, 0.0, 0.0]  # roll, pitch, yaw [deg]
+      t: [ 0.91,  0.0,  1.95 ]  # (x, y, z) [meters]
+      R: [180, 0.0, 0.0]  # roll, pitch, yaw [deg]
 
     lidar2baselink:
-      t: [0.0, 0.0, 0.0] # (x, y, z) [meters]
-      R: [0.0, 0.0, 0.0]   # roll, pitch, yaw [deg]
+      t: [ 0.91,  0.0,  1.95 ] # (x, y, z) [meters]
+      R: [180, 0.0, 0.0]   # roll, pitch, yaw [deg]
     # imu2baselink:
     #   t: [0.912, 0.008, 1.948]  # (x, y, z) [meters]
     #   R: [179.521, 0.045, -2.412]  # roll, pitch, yaw [deg]
