@@ -2,7 +2,7 @@
 
     <arg name="rviz" default="false"/>
     
-    <arg name="odom_topic" default="/limoncello/odom" />
+    <arg name="odom_topic" default="/odom_limoncello" />
 
     <node pkg="limoncello" type="limoncello" name="limoncello" output="screen" >
         <rosparam file="$(find limoncello)/config/livox.yaml" />
