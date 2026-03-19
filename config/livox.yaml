@@ -9,7 +9,7 @@ topics:
   frame_id: odom_limo      
 
 
-verbose: true   # print debug/performance board
+verbose: false   # print debug/performance board
 debug: false     # fill useful intermediate pcl (deskewed, processed ...) 
                 # for visualizing purposes
 

@@ -180,11 +180,9 @@ public:
     double end_stamp   = point_time(raw->points.back(), sweep_time) + offset;
 
     if (state_buffer_.front().stamp < end_stamp) {
-      std::cout << std::setprecision(20);
-      std::cout <<
-        "PROPAGATE WAITING... \n" <<
-        "     - buffer time: " << state_buffer_.front().stamp << "\n"
-        "     - end scan time: " << end_stamp << std::endl;
+      ROS_DEBUG_THROTTLE(2.0, "[LIMONCELLO] Propagate waiting: buffer=%.6f end_scan=%.6f gap=%.3fms",
+                         state_buffer_.front().stamp, end_stamp,
+                         (end_stamp - state_buffer_.front().stamp) * 1000.0);
 
       std::unique_lock<decltype(mtx_buffer_)> lock(mtx_buffer_);
       cv_prop_stamp_.wait(lock, [this, &end_stamp] { 
