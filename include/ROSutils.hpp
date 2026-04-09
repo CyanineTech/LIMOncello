@@ -270,11 +270,11 @@ void fill_config(Config& cfg, ros::NodeHandle& nh) {
 // 从 TF 查询外参，覆盖配置文件中的静态值
 bool lookup_tf_extrinsics(Config& cfg, double timeout_sec = 10.0) {
   if (!cfg.sensors.extrinsics.use_tf_extrinsics) {
-    ROS_INFO("Using static extrinsics from config file");
+    ROS_WARN("Using static extrinsics from config file");
     return true;
   }
 
-  ROS_INFO("Looking up extrinsics from TF: %s -> %s", 
+  ROS_WARN("Looking up extrinsics from TF: %s -> %s", 
            cfg.sensors.extrinsics.base_frame.c_str(),
            cfg.sensors.extrinsics.lidar_frame.c_str());
 
@@ -320,9 +320,9 @@ bool lookup_tf_extrinsics(Config& cfg, double timeout_sec = 10.0) {
     // 转换为 RPY 用于日志输出
     Eigen::Vector3d rpy = R.eulerAngles(0, 1, 2) * 180.0 / M_PI;
 
-    ROS_INFO("TF extrinsics loaded successfully:");
-    ROS_INFO("  Translation: [%.3f, %.3f, %.3f]", t.x(), t.y(), t.z());
-    ROS_INFO("  Rotation RPY (deg): [%.3f, %.3f, %.3f]", rpy.x(), rpy.y(), rpy.z());
+    ROS_WARN("TF extrinsics loaded successfully:");
+    ROS_WARN("  Translation: [%.3f, %.3f, %.3f]", t.x(), t.y(), t.z());
+    ROS_WARN("  Rotation RPY (deg): [%.3f, %.3f, %.3f]", rpy.x(), rpy.y(), rpy.z());
 
     return true;
 

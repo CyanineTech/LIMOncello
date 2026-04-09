@@ -116,6 +116,7 @@ public:
         if (cfg.sensors.calibration.accel)
           state_.b_a(accel_avg - state_.R().transpose()*state_.g());
 
+        prev_imu_ = imu;  // 初始化 prev_imu_，避免下一帧 dt 计算异常
         imu_calibrated_ = true;
       }
 
@@ -265,7 +266,12 @@ int main(int argc, char** argv) {
   Config& cfg = Config::getInstance();
   fill_config(cfg, nh);
 
-  lookup_tf_extrinsics(cfg);
+  if (!lookup_tf_extrinsics(cfg)) {
+    ROS_ERROR("TF extrinsics lookup FAILED! Using YAML fallback: t=[%.3f, %.3f, %.3f]",
+              cfg.sensors.extrinsics.imu2baselink.translation().x(),
+              cfg.sensors.extrinsics.imu2baselink.translation().y(),
+              cfg.sensors.extrinsics.imu2baselink.translation().z());
+  }
 
   // Initialize manager (reads from config)
   Manager manager = Manager(nh);
