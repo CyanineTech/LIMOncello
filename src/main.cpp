@@ -86,21 +86,24 @@ public:
     if (first_imu_stamp_ < 0.)
       first_imu_stamp_ = imu.stamp;
     
+    // IMU 校准: 前一段时间内累积平均值, 作为零偏初始值; 可选重力对齐
     if (not imu_calibrated_) {
       static int N(0);
       static Eigen::Vector3d gyro_avg(0., 0., 0.);
       static Eigen::Vector3d accel_avg(0., 0., 0.);
-
+      // 注意: 这里的时间是 IMU 自带的时间戳,如果 IMU 时间不连续或不正确,可能导致校准失败
       if ((imu.stamp - first_imu_stamp_) < cfg.sensors.calibration.time) {
         gyro_avg  += imu.ang_vel;
         accel_avg += imu.lin_accel; 
         N++;
 
       } else {
+        // 计算平均值
         gyro_avg /= N;
         accel_avg /= N;
 
         if (cfg.sensors.calibration.gravity_align) {
+          //重力对齐: 以平均加速度方向为重力方向,调整初始姿态使其与全局坐标系对齐
           Eigen::Vector3d g_m = (accel_avg - state_.b_a()).normalized(); 
                           g_m *= cfg.sensors.extrinsics.gravity;
           
@@ -110,6 +113,7 @@ public:
           state_.quat((state_.quat() * dq).normalized());
         }
         
+        // 陀螺仪和加速度计零偏校准
         if (cfg.sensors.calibration.gyro)
           state_.b_w(gyro_avg);
 
@@ -126,12 +130,15 @@ public:
       if (dt < 0)
         ROS_ERROR("IMU timestamps not correct");
 
+      //时间戳检查: 如果 IMU 时间不连续或跳变过大,可能导致状态预测异常,这里简单地限制 dt 的范围,避免跳到未来或过度预测
       dt = (dt < 0 or dt >= imu.stamp) ? 1./cfg.sensors.imu.hz : dt;
 
       // Correct acceleration
+      //校正加速度计的系统误差:这里只是用简单的比例因子做的矫正
       imu.lin_accel = cfg.sensors.intrinsics.sm * imu.lin_accel;
       prev_imu_ = imu;
 
+      //用校准后的 IMU 数据预测状态,并将预测结果存入缓冲区,供 LiDAR 回调使用 (位置,速度,姿态等)
       mtx_state_.lock();
         state_.predict(imu, dt);
       mtx_state_.unlock();
@@ -142,6 +149,7 @@ public:
 
       cv_prop_stamp_.notify_one();
 
+      // 以 IMU 频率(~200Hz)发布里程计和 TF, 是系统的高频位姿输出
       pub_state_.publish(toROS(state_, imu.stamp));
       publishTFs(state_, br, imu.stamp);
     }
@@ -151,41 +159,56 @@ public:
   void lidar_callback(const sensor_msgs::PointCloud2::ConstPtr& msg) {
     Config& cfg = Config::getInstance();
 
+    //检查IMU数据是否完成校准,如果没有校准完成,则不处理 LiDAR 数据,避免使用不可靠的状态预测结果
     if (not imu_calibrated_)
       return;
     
+    //检查是否收到处理后的IMU数据
     if (state_buffer_.empty()) {
       ROS_ERROR("[LIMONCELLO] No IMUs received");
       return;
     }
     
+    // 原始点云数据结构: PointCloudT 通常是 pcl::PointCloud<PointT>,
+    // 这里用智能指针保存从 ROS PointCloud2 转换后的整帧 LiDAR 点云
     PointCloudT::Ptr raw(boost::make_shared<PointCloudT>());
     fromROS(*msg, *raw);
 
+    // 点云有效性检查: 如果转换后没有任何点,说明当前帧无效,直接丢弃
     if (raw->points.empty()) {
       ROS_ERROR("[LIMONCELLO] Raw PointCloud is empty!");
       return;
     }
 
+    //获取点云中每个点的时间戳,并计算整帧点云的起止时间,以便后续与状态缓冲区中的状态进行时间对齐和插值
     PointTime point_time = point_time_func();
     double sweep_time = msg->header.stamp.toSec();
     
+    //估计点云和IMU状态之间的时间偏移
+    //注意: 对于 Livox 自带 IMU + Livox 点云这类同源时间戳数据,通常已经完成硬件级同步,
+    //一般不建议开启 cfg.sensors.time_offset,否则可能重复修正并引入额外误差。
+    //只有在实际观测到 IMU/点云存在稳定时延时,才建议开启该选项做粗略补偿。
     double offset = 0.0;
     if (cfg.sensors.time_offset) { // automatic sync (not precise!)
       offset = state_.stamp - point_time(raw->points.back(), sweep_time) - 1.e-4; 
       if (offset > 0.0) offset = 0.0; // don't jump into future
     }
 
-    // Wait for state buffer
+    // 计算当前整帧点云的起止时间:
+    // 后面会用这个时间区间去状态缓冲区里做插值/去畸变。
     double start_stamp = point_time(raw->points.front(), sweep_time) + offset;
     double end_stamp   = point_time(raw->points.back(), sweep_time) + offset;
 
+    // 如果状态缓冲区里最新可用状态的时间 still 早于本帧点云结束时间,
+    // 说明 IMU/传播线程还没有把状态推到这帧扫描结束位置,
+    // 此时先阻塞等待,直到 buffer 覆盖到 end_stamp 为止。
     if (state_buffer_.front().stamp < end_stamp) {
       ROS_DEBUG_THROTTLE(2.0, "[LIMONCELLO] Propagate waiting: buffer=%.6f end_scan=%.6f gap=%.3fms",
                          state_buffer_.front().stamp, end_stamp,
                          (end_stamp - state_buffer_.front().stamp) * 1000.0);
 
       std::unique_lock<decltype(mtx_buffer_)> lock(mtx_buffer_);
+      // 等待状态数据准备好。
       cv_prop_stamp_.wait(lock, [this, &end_stamp] { 
           return state_buffer_.front().stamp >= end_stamp;
       });
@@ -196,24 +219,30 @@ public:
     States interpolated = filter_states(state_buffer_, start_stamp, end_stamp);
   mtx_buffer_.unlock();
 
+    //插值检查
     if (start_stamp < interpolated.front().stamp or interpolated.size() == 0) {
       // every point needs to have a state associated not in the past
       ROS_WARN("Not enough interpolated states for deskewing pointcloud \n");
       return;
     }
 
-  mtx_state_.lock();
+  mtx_state_.lock();//加锁:防止IMU回调同时修改state_ 
 
+    //去畸变: 把每个点从它被采集时的局部坐标系，统一变换到当前帧结束时的坐标系。
     PointCloudT::Ptr deskewed    = deskew(raw, state_, interpolated, offset, sweep_time);
+    //下采样和滤波: 减少点数，降低后续计算量，同时保持空间分布均匀
     PointCloudT::Ptr downsampled = voxel_grid(deskewed);
-    PointCloudT::Ptr filtered    = filter(downsampled, state_.isometry() * state_.L2I_isometry());
+    //滤波: 根据配置的条件过滤掉一些点,比如距离过远的点,或者在某些区域内的点,以提高地图质量和匹配效率
+    PointCloudT::Ptr filtered    = filter(downsampled, state_.isometry() * state_.L2I_isometry());// LiDAR 坐标系 → 全局坐标系 的变换
 
+    // 滤波结果检查: 如果滤波后没有任何点,说明当前帧无效,直接丢弃
     if (filtered->points.empty()) {
       ROS_ERROR("[LIMONCELLO] Filtered & downsampled cloud is empty!");
       mtx_state_.unlock();
       return;
     }
 
+    // IESKF 观测更新: 用点云与地图匹配, 迭代修正位姿/bias/重力
     state_.update(filtered, ioctree_);
 
     Eigen::Isometry3f T = (state_.isometry() * state_.L2I_isometry()).cast<float>();

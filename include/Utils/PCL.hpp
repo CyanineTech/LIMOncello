@@ -45,7 +45,12 @@ typedef pcl::PointCloud<PointT> PointCloudT;
 typedef std::function<double(const PointT&, const double&)> PointTime;
 typedef std::function<bool(const PointT&, const PointT&)> PointTimeComp;
 
-
+/**
+ * LiDAR 时间戳处理函数: 根据配置的 LiDAR 类型和时间戳定义,返回一个用于计算点云中每个点的时间戳的函数.
+ * 该函数接受一个点和当前扫描的时间戳,根据 LiDAR 类型和时间戳定义计算出该点的绝对时间戳,用于后续的点云去畸变和状态更新.
+ * 支持的 LiDAR 类型包括 OUSTER, VELODYNE, HESAI, LIVOX, 每种类型的时间戳定义不同,需要根据配置进行处理.
+ * 该函数使得代码能够适配不同类型的 LiDAR 传感器,并且能够正确处理它们的时间戳,保证点云数据的准确性和一致性.
+ */
 PointTime point_time_func() {
   Config& cfg = Config::getInstance();
 
@@ -73,7 +78,10 @@ PointTime point_time_func() {
   }
 }
 
-
+/**
+ * LiDAR 点云时间戳比较函数: 根据配置的 LiDAR 类型和时间戳定义,返回一个用于比较点云中两个点的时间戳的函数.
+ * 该函数接受两个点,根据 LiDAR 类型和时间戳定义比较它们的时间戳,返回一个布尔值表示第一个点是否比第二个点更早或更晚.
+ */
 PointTimeComp get_point_time_comp() {
   Config& cfg = Config::getInstance();
 

@@ -12,9 +12,21 @@
 #include "Utils/Profiler.hpp"
 #include "Utils/Config.hpp"
 
-
+/**
+ * LiDAR 点云处理相关函数,包括点云去畸变、滤波、下采样等.
+ * 从状态环形缓冲区中截取 [start, end) 附近的一小段状态序列.
+ *
+ * 这里处理的不是点云本身,而是“用于点云去畸变(deskew)的状态轨迹”: 
+ * - states 一般是按时间保存的 State 缓冲区(boost::circular_buffer)
+ * - 该函数会筛出 start 到 end 之间的状态
+ * - 另外会额外保留 1 个 start 之前的状态,便于后续插值
+ *
+ * 因此,它对点云预处理的作用是“准备去畸变所需的状态数据”,
+ * 而不是直接修改点云点坐标。
+ */
 States filter_states(const States& states, const double& start, const double& end) {
 
+  // 返回的 States 是一个新的环形缓冲区, 里面包含了 [start, end) 附近的状态数据,
   States out(1000); // Always initialize circular buffer !!
 
   for (const auto& state : states) {
@@ -33,7 +45,17 @@ States filter_states(const States& states, const double& start, const double& en
   return out;
 }
 
-
+/**
+ * 点云去畸变函数,根据每个点的时间戳在状态缓冲区里插值出对应的状态,并把点从当时的状态坐标系变换到当前状态坐标系。
+ * 输入:
+ * - cloud: 原始点云,每个点都包含一个时间戳(  通过 point_time_func() 获取)
+ * - state: 当前状态,包含当前时刻的位姿和其他状态信息
+ * - buffer: 状态缓冲区,包含了当前状态以及之前一段时间的状态数据,用于插值
+ * - offset: 点云时间戳的全局偏移,用于修正点云时间戳与状态时间戳之间的系统误差
+ * - sweep_time: 当前点云帧的时间戳,用于计算每个点的相对时间
+ * 输出:
+ * - 去畸变后的点云,每个点都被变换到当前状态坐标系下,以消除运动畸变。 
+ */
 PointCloudT::Ptr deskew(const PointCloudT::Ptr& cloud,
                         const State& state,
                         const States& buffer,
@@ -98,7 +120,14 @@ PROFC_NODE("deskew")
   return out;
 }
 
-
+/**
+ * 点云滤波函数,根据配置的条件过滤掉一些点,比如距离过远的点,或者在某些区域内的点,以提高地图质量和匹配效率。
+ * 输入:
+ * - cloud: 输入点云,通常是已经去畸变后的点云
+ * - lidar2baselink: LiDAR 到基座坐标系的变换,用于在滤波条件中把点云点从 LiDAR 坐标系转换到基座坐标系进行判断
+ * 输出:
+ * - 滤波后的点云,只包含满足条件的点,以提高后续处理的效率和地图质量。
+ */
 PointCloudT::Ptr filter(const PointCloudT::Ptr& cloud, 
                         const Eigen::Isometry3d& lidar2baselink) {
 
@@ -153,7 +182,13 @@ PROFC_NODE("filter")
   return out;
 }
 
-
+/**
+ * 点云下采样函数,使用 PCL 的 VoxelGrid 滤波器对点云进行下采样。
+ * 输入:
+ * - cloud: 输入点云,通常是已经去畸变和滤波后的点云
+ * 输出:
+ * - 下采样后的点云,每个体素格子内的点被替换为一个代表点,以减少点云的数量并加快后续处理速度。
+ */
 PointCloudT::Ptr voxel_grid(const PointCloudT::Ptr& cloud) {
 
 PROFC_NODE("downsample")
