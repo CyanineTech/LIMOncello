@@ -171,6 +171,7 @@ struct Octree {
   void clear() {
     delete root_;
     root_ = nullptr;
+    num_points_ = 0;
   }
 
   size_t size() {

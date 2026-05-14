@@ -6,6 +6,7 @@
 #include <ros/ros.h>
 
 #include <geometry_msgs/Vector3.h>
+#include <geometry_msgs/PoseWithCovarianceStamped.h>
 #include <sensor_msgs/Imu.h>
 #include <sensor_msgs/PointCloud2.h>
 #include <std_msgs/Bool.h>
@@ -45,6 +46,7 @@ class Manager {
                  pub_filtered_;
 
   tf2_ros::TransformBroadcaster br;
+  ros::Subscriber initialpose_sub_;
   
 public:
   Manager(ros::NodeHandle& nh) : first_imu_stamp_(-1.0), 
@@ -72,6 +74,10 @@ public:
     pub_deskewed_    = nh.advertise<sensor_msgs::PointCloud2>("debug/deskewed",    10);
     pub_downsampled_ = nh.advertise<sensor_msgs::PointCloud2>("debug/downsampled", 10);
     pub_filtered_    = nh.advertise<sensor_msgs::PointCloud2>("debug/filtered",    10);
+
+    // /initialpose: 重定位触发 -> 清地图+放大P, 让IESKF从新位置重收敛
+    initialpose_sub_ = nh.subscribe("/initialpose", 1,
+        &Manager::initialpose_callback, this);
   };
   
   ~Manager() = default;
@@ -279,6 +285,40 @@ public:
       stop_ioctree_update_ = msg->data;
       ROS_INFO("Stopping ioctree updates from now onwards");
     }
+  }
+
+
+  // /initialpose 重定位回调
+  //
+  // 触发时机: 用户在 RViz 发布 2D Pose Estimate
+  // 此时 neo_localization 已重算 map->odom_2D 偏移, 位姿补偿已完成.
+  // LIMOncello 需要做的是:
+  //   1. 清空 iOctree 地图 — 旧地图可能包含漂移期间的错误匹配平面,
+  //      继续使用会导致 update() 越匹配越偏. 清空后从当前位置重建.
+  //   2. 放大协方差 P — 让 K≈1, IESKF 在前几帧几乎完全信任 LiDAR 观测,
+  //      快速收敛到正确轨道. 2-3 帧 (~200-300ms) 后 P 恢复正常.
+  //   3. 清空 state_buffer_ — 旧的 IMU 状态序列与新地图不一致,
+  //      避免去畸变使用过时数据.
+  // 不需要改 X(位姿): neo_localization 通过 map->odom 偏移已补偿漂移.
+  // 不需要改 bias/g: IMU 传感器特性与机器人位置无关.
+  void initialpose_callback(
+      const geometry_msgs::PoseWithCovarianceStamped::ConstPtr& msg)
+  {
+    Config& cfg = Config::getInstance();
+
+    mtx_state_.lock();
+      state_.P.setIdentity();// 放大协方差,让 IESKF 快速收敛
+      state_.P *= cfg.ikfom.covariance.initial_cov * 10.0;
+      ioctree_.clear();
+    mtx_state_.unlock();
+
+    mtx_buffer_.lock();
+      state_buffer_.clear();
+    mtx_buffer_.unlock();
+
+    ROS_WARN("[LIMOncello] /initialpose received -> map cleared, "
+             "covariance inflated, buffer flushed. "
+             "Reconverging from current position...");
   }
 
 };
