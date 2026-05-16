@@ -10,6 +10,7 @@
 #include <sensor_msgs/Imu.h>
 #include <sensor_msgs/PointCloud2.h>
 #include <std_msgs/Bool.h>
+#include <nav_msgs/Odometry.h>
 
 
 #include "Core/Octree.hpp"
@@ -47,11 +48,18 @@ class Manager {
 
   tf2_ros::TransformBroadcaster br;
   ros::Subscriber initialpose_sub_;
+  ros::Subscriber wheel_odom_sub_;
+
+  // 缓存最新 wheel odom, 供 initialpose_callback 重置 state 用
+  std::mutex mtx_wheel_odom_;
+  nav_msgs::Odometry latest_wheel_odom_;
+  bool wheel_odom_received_;
   
 public:
   Manager(ros::NodeHandle& nh) : first_imu_stamp_(-1.0), 
                                  state_buffer_(1000), 
                                  stop_ioctree_update_(false),
+                                 wheel_odom_received_(false),
                                  ioctree_() {
 
     Config& cfg = Config::getInstance();
@@ -75,9 +83,13 @@ public:
     pub_downsampled_ = nh.advertise<sensor_msgs::PointCloud2>("debug/downsampled", 10);
     pub_filtered_    = nh.advertise<sensor_msgs::PointCloud2>("debug/filtered",    10);
 
-    // /initialpose: 重定位触发 -> 清地图+放大P, 让IESKF从新位置重收敛
+    // /initialpose: 重定位触发 -> 清地图+重置state+放大P, 让IESKF从新位置重收敛
     initialpose_sub_ = nh.subscribe("/initialpose", 1,
         &Manager::initialpose_callback, this);
+
+    // 订阅 wheel odom, 仅缓存最新帧供 initialpose 重置用
+    wheel_odom_sub_ = nh.subscribe("/odom_wheel", 10,
+        &Manager::wheel_odom_callback, this, ros::TransportHints().tcpNoDelay());
   };
   
   ~Manager() = default;
@@ -252,13 +264,18 @@ public:
     state_.update(filtered, ioctree_);
 
     Eigen::Isometry3f T = (state_.isometry() * state_.L2I_isometry()).cast<float>();
+
+    PointCloudT::Ptr to_save(boost::make_shared<PointCloudT>());
+    pcl::transformPointCloud(*filtered, *to_save, T);
+
+    // Update map (must be under mtx_state_ to avoid race with initialpose_callback clear())
+    if (not stop_ioctree_update_)
+      ioctree_.update(to_save->points);
+
   mtx_state_.unlock();
 
     PointCloudT::Ptr global(boost::make_shared<PointCloudT>());
     pcl::transformPointCloud(*deskewed, *global, T);
-
-    PointCloudT::Ptr to_save(boost::make_shared<PointCloudT>());
-    pcl::transformPointCloud(*filtered, *to_save, T);
 
     // Publish
     pub_state_.publish(toROS(state_, sweep_time));
@@ -271,12 +288,15 @@ public:
       pub_filtered_.publish(toROS(to_save, sweep_time));
     }
 
-    // Update map
-    if (not stop_ioctree_update_)
-      ioctree_.update(to_save->points);
-
     if (cfg.verbose)
       PROFC_PRINT()
+  }
+
+
+  void wheel_odom_callback(const nav_msgs::Odometry::ConstPtr& msg) {
+    std::lock_guard<std::mutex> lk(mtx_wheel_odom_);
+    latest_wheel_odom_ = *msg;
+    wheel_odom_received_ = true;
   }
 
 
@@ -290,35 +310,105 @@ public:
 
   // /initialpose 重定位回调
   //
-  // 触发时机: 用户在 RViz 发布 2D Pose Estimate
-  // 此时 neo_localization 已重算 map->odom_2D 偏移, 位姿补偿已完成.
-  // LIMOncello 需要做的是:
-  //   1. 清空 iOctree 地图 — 旧地图可能包含漂移期间的错误匹配平面,
-  //      继续使用会导致 update() 越匹配越偏. 清空后从当前位置重建.
-  //   2. 放大协方差 P — 让 K≈1, IESKF 在前几帧几乎完全信任 LiDAR 观测,
-  //      快速收敛到正确轨道. 2-3 帧 (~200-300ms) 后 P 恢复正常.
-  //   3. 清空 state_buffer_ — 旧的 IMU 状态序列与新地图不一致,
-  //      避免去畸变使用过时数据.
-  // 不需要改 X(位姿): neo_localization 通过 map->odom 偏移已补偿漂移.
-  // 不需要改 bias/g: IMU 传感器特性与机器人位置无关.
+  // 完整动作:
+  //   1. 用 wheel odom 的当前位姿重置 state (p, quat), 速度清零
+  //      → 保证从一个合理的物理位置重建地图
+  //      → 防止发散后 state 仍在百万级 → 地图建在百万米外 → 永远无法恢复
+  //   2. 清空 iOctree 地图
+  //   3. 大幅放大 P → IESKF 前几帧几乎完全信任 LiDAR 观测, 快速收敛
+  //   4. 清空 state_buffer_
+  //   5. bias/g 保留不动 (硬件特性不变, P 放大后 IESKF 会重新估计)
   void initialpose_callback(
       const geometry_msgs::PoseWithCovarianceStamped::ConstPtr& msg)
   {
     Config& cfg = Config::getInstance();
 
+    // 记录重置前的 state (用于诊断日志)
+    Eigen::Vector3d old_p, old_v;
+    Eigen::Quaterniond old_q;
+    {
+      std::lock_guard<std::mutex> lk(mtx_state_);
+      old_p = state_.p();
+      old_v = state_.v();
+      old_q = state_.quat();
+    }
+
+    // 从 wheel odom 获取重置目标位姿
+    bool has_wheel = false;
+    double wh_x = 0, wh_y = 0, wh_yaw = 0;
+    {
+      std::lock_guard<std::mutex> lk(mtx_wheel_odom_);
+      if (wheel_odom_received_) {
+        has_wheel = true;
+        wh_x = latest_wheel_odom_.pose.pose.position.x;
+        wh_y = latest_wheel_odom_.pose.pose.position.y;
+        const auto& oq = latest_wheel_odom_.pose.pose.orientation;
+        wh_yaw = std::atan2(2.0*(oq.w*oq.z + oq.x*oq.y),
+                            1.0 - 2.0*(oq.y*oq.y + oq.z*oq.z));
+      }
+    }
+
     mtx_state_.lock();
-      state_.P.setIdentity();// 放大协方差,让 IESKF 快速收敛
-      state_.P *= cfg.ikfom.covariance.initial_cov * 10.0;
+
+      if (has_wheel) {
+        // 用 wheel odom 的 2D 位姿重置 state (Z 保持 0, roll/pitch 保持不变)
+        Eigen::Vector3d new_p(wh_x, wh_y, 0.0);
+        // imu2baselink 逆变换: state 存的是 IMU 帧位姿, 需要 T_M_I = T_M_B * T_B_I
+        Eigen::Isometry3d T_B_I = cfg.sensors.extrinsics.imu2baselink;
+        Eigen::Isometry3d T_M_B;
+        T_M_B.setIdentity();
+        T_M_B.translation() = new_p;
+        T_M_B.linear() = Eigen::AngleAxisd(wh_yaw, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+        Eigen::Isometry3d T_M_I = T_M_B * T_B_I;
+
+        state_.p(T_M_I.translation());
+        state_.quat(Eigen::Quaterniond(T_M_I.linear()).normalized());
+        state_.v(Eigen::Vector3d::Zero());
+      } else {
+        // wheel odom 还没收到, 只能把速度清零, 位置不动
+        state_.v(Eigen::Vector3d::Zero());
+        ROS_WARN("[LIMOncello] /initialpose: no wheel odom yet, "
+                 "state position NOT reset (only v=0)");
+      }
+
+      // 大幅放大 P, 让 IESKF 快速收敛到 LiDAR 观测
+      state_.P.setIdentity();
+      state_.P *= cfg.ikfom.covariance.initial_cov * 1000.0;
+
       ioctree_.clear();
+
     mtx_state_.unlock();
 
     mtx_buffer_.lock();
       state_buffer_.clear();
     mtx_buffer_.unlock();
 
-    ROS_WARN("[LIMOncello] /initialpose received -> map cleared, "
-             "covariance inflated, buffer flushed. "
-             "Reconverging from current position...");
+    // 诊断日志: 重置前后对比 + wheel odom 值, 方便定位发散→恢复是否成功
+    Eigen::Vector3d new_p_log, new_v_log;
+    Eigen::Quaterniond new_q_log;
+    {
+      std::lock_guard<std::mutex> lk(mtx_state_);
+      new_p_log = state_.p();
+      new_v_log = state_.v();
+      new_q_log = state_.quat();
+    }
+
+    ROS_WARN("[LIMOncello] /initialpose received -> state reset + map cleared\n"
+             "  BEFORE: p=[%.3f, %.3f, %.3f] v=[%.3f, %.3f, %.3f] "
+             "q=[w=%.4f, xyz=(%.4f, %.4f, %.4f)]\n"
+             "  AFTER:  p=[%.3f, %.3f, %.3f] v=[%.3f, %.3f, %.3f] "
+             "q=[w=%.4f, xyz=(%.4f, %.4f, %.4f)]\n"
+             "  wheel_odom: %s (x=%.3f, y=%.3f, yaw=%.3f deg)\n"
+             "  P *= %.1f, ioctree cleared, buffer flushed. Reconverging...",
+             old_p.x(), old_p.y(), old_p.z(),
+             old_v.x(), old_v.y(), old_v.z(),
+             old_q.w(), old_q.x(), old_q.y(), old_q.z(),
+             new_p_log.x(), new_p_log.y(), new_p_log.z(),
+             new_v_log.x(), new_v_log.y(), new_v_log.z(),
+             new_q_log.w(), new_q_log.x(), new_q_log.y(), new_q_log.z(),
+             has_wheel ? "YES" : "NO",
+             wh_x, wh_y, wh_yaw * 180.0 / M_PI,
+             cfg.ikfom.covariance.initial_cov * 1000.0);
   }
 
 };

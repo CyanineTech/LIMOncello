@@ -415,6 +415,8 @@ PROFC_NODE("update")
   }
 
 // Setters
+  void p   (const Vec<3>& in)             { X.element<0>() = manif::SGal3d(in, quat(), v(), t()); }
+  void v   (const Vec<3>& in)             { X.element<0>() = manif::SGal3d(p(), quat(), in, t()); }
   void quat(const Eigen::Quaterniond& in) { X.element<0>() = manif::SGal3d(p(), in, v(), t()); } 
   void b_w (const Vec<3>& in)             { X.element<2>() = manif::R3d(in);                   }
   void b_a (const Vec<3>& in)             { X.element<3>() = manif::R3d(in);                   }
