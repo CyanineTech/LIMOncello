@@ -153,8 +153,6 @@ void fill_config(Config& cfg, ros::NodeHandle& nh) {
 
   nh.getParam("verbose", cfg.verbose);
   nh.getParam("debug",   cfg.debug);
-  cfg.health_monitor = false;
-  nh.getParam("health_monitor", cfg.health_monitor);
 
   // TOPICS
   nh.getParam("topics/input/lidar",               cfg.topics.input.lidar);

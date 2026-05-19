@@ -12,7 +12,6 @@ topics:
 verbose: false          # print debug/performance board
 debug: false            # fill useful intermediate pcl (deskewed, processed ...) 
                         # for visualizing purposes
-health_monitor: false   # enable periodic state health logs ([LIMO][health] / [LIMO][diverge])
 
 sensors:
   lidar:

@@ -1,4 +1,3 @@
-#include <atomic>
 #include <mutex>
 #include <condition_variable>
 
@@ -7,7 +6,6 @@
 #include <ros/ros.h>
 
 #include <geometry_msgs/Vector3.h>
-#include <geometry_msgs/PoseWithCovarianceStamped.h>
 #include <sensor_msgs/Imu.h>
 #include <sensor_msgs/PointCloud2.h>
 #include <std_msgs/Bool.h>
@@ -48,27 +46,12 @@ class Manager {
                  pub_filtered_;
 
   tf2_ros::TransformBroadcaster br;
-  ros::Subscriber initialpose_sub_;
-  ros::Subscriber wheel_odom_sub_;
-
-  // 缓存最新 wheel odom, 供 initialpose_callback 重置 state 用
-  std::mutex mtx_wheel_odom_;
-  nav_msgs::Odometry latest_wheel_odom_;
-  bool wheel_odom_received_;
-
-  // 重定位后第一帧 LiDAR 标志: 仅用于日志/Δwheel 校验。
-  // 真正的 "空地图 update noop" 由 State::update() 内 `if (map.size()==0) return;` 兜底,
-  // 这里只是为了让日志能明确指出 "这一帧发生在 reloc 之后", 方便事后排查。
-  std::atomic<bool> relocalizing_after_clear_{false};
-  ros::Time last_initialpose_time_;
-
 
 
 public:
   Manager(ros::NodeHandle& nh) : first_imu_stamp_(-1.0), 
                                  state_buffer_(1000), 
                                  stop_ioctree_update_(false),
-                                 wheel_odom_received_(false),
                                  ioctree_() {
 
     Config& cfg = Config::getInstance();
@@ -91,17 +74,6 @@ public:
     pub_deskewed_    = nh.advertise<sensor_msgs::PointCloud2>("debug/deskewed",    10);
     pub_downsampled_ = nh.advertise<sensor_msgs::PointCloud2>("debug/downsampled", 10);
     pub_filtered_    = nh.advertise<sensor_msgs::PointCloud2>("debug/filtered",    10);
-
-    // /initialpose: 重定位触发 -> 清地图+重置state+放大P, 让IESKF从新位置重收敛
-    initialpose_sub_ = nh.subscribe("/initialpose", 1,
-        &Manager::initialpose_callback, this);
-
-    // 订阅 wheel odom, 仅缓存最新帧供 initialpose 重置用
-    wheel_odom_sub_ = nh.subscribe("/odom_wheel", 10,
-        &Manager::wheel_odom_callback, this, ros::TransportHints().tcpNoDelay());
-
-    if (cfg.health_monitor)
-      ROS_INFO("[LIMO] Health monitor ENABLED (grep [LIMO][health] / [LIMO][diverge])");
   };
   
   ~Manager() = default;
@@ -280,56 +252,17 @@ public:
     }
 
     // IESKF 观测更新: 用点云与地图匹配, 迭代修正位姿/bias/重力
-    // 注: State::update() 内部对 map.size()==0 已 early-return, 所以重定位后第一帧
-    //     update 是 noop, P 不会被错误收缩。这里只打印一行确认日志便于排查。
-    bool first_frame_after_reloc = relocalizing_after_clear_.exchange(false);
-    if (first_frame_after_reloc) {
-      // Δwheel = 当前 state(base_link 系) 与 wheel_odom 的水平偏差
-      // reset 时刚把 state.p 设成 wheel_odom 位置, 这里应该非常小; 若 > 0.5m 说明
-      // imu2baselink 外参或 reset 逻辑有问题
-      Eigen::Vector3d p_now_I = state_.p();
-      Eigen::Isometry3d T_M_I_now = Eigen::Isometry3d::Identity();
-      T_M_I_now.translation() = p_now_I;
-      T_M_I_now.linear() = state_.quat().toRotationMatrix();
-      Eigen::Isometry3d T_M_B_now = T_M_I_now * cfg.sensors.extrinsics.imu2baselink.inverse();
-      double bx = T_M_B_now.translation().x();
-      double by = T_M_B_now.translation().y();
-
-      double wx = 0, wy = 0; bool has_w = false;
-      {
-        std::lock_guard<std::mutex> lk(mtx_wheel_odom_);
-        if (wheel_odom_received_) {
-          has_w = true;
-          wx = latest_wheel_odom_.pose.pose.position.x;
-          wy = latest_wheel_odom_.pose.pose.position.y;
-        }
-      }
-      double dwheel = has_w ? std::hypot(bx - wx, by - wy) : -1.0;
-      ROS_WARN("[LIMO][first-frame] AFTER reloc: state.base=[%.3f %.3f] wheel=[%.3f %.3f] "
-               "Δwheel=%.3fm | map.size=0 → update is noop, building map at this pose | "
-               "filtered_pts=%zu",
-               bx, by, wx, wy, dwheel, filtered->points.size());
-      if (has_w and dwheel > 0.5) {
-        ROS_ERROR("[LIMO][first-frame] Δwheel=%.3fm > 0.5m: reset position likely WRONG "
-                  "(check imu2baselink extrinsics or wheel_odom freshness)", dwheel);
-      }
-    }
-
     state_.update(filtered, ioctree_);
 
     Eigen::Isometry3f T = (state_.isometry() * state_.L2I_isometry()).cast<float>();
-
-    PointCloudT::Ptr to_save(boost::make_shared<PointCloudT>());
-    pcl::transformPointCloud(*filtered, *to_save, T);
-
-    // Update map (must be under mtx_state_ to avoid race with initialpose_callback clear())
-    if (not stop_ioctree_update_)
-      ioctree_.update(to_save->points);
 
   mtx_state_.unlock();
 
     PointCloudT::Ptr global(boost::make_shared<PointCloudT>());
     pcl::transformPointCloud(*deskewed, *global, T);
+
+    PointCloudT::Ptr to_save(boost::make_shared<PointCloudT>());
+    pcl::transformPointCloud(*filtered, *to_save, T);
 
     // Publish
     pub_state_.publish(toROS(state_, sweep_time));
@@ -342,63 +275,12 @@ public:
       pub_filtered_.publish(toROS(to_save, sweep_time));
     }
 
+    // Update map: 将当前帧的点云（已经去畸变、滤波、变换到全局坐标系）加入地图的八叉树结构中, 以供后续帧的匹配使用。
+    if (not stop_ioctree_update_)
+      ioctree_.update(to_save->points);
+
     if (cfg.verbose)
       PROFC_PRINT()
-
-    // ---------- Health monitor & divergence warnings ----------
-    // grep tags: [LIMO][health] (5s periodic), [LIMO][diverge] (1s threshold alerts)
-    // Controlled by param ~health_monitor (default: false)
-    if (cfg.health_monitor) {
-      const Eigen::Vector3d p  = state_.p();
-      const Eigen::Vector3d v  = state_.v();
-      const Eigen::Vector3d ba = state_.b_a();
-      const Eigen::Vector3d bw = state_.b_w();
-      const double p_norm  = p.norm();
-      const double v_norm  = v.norm();
-      const double ba_norm = ba.norm();
-      const double bw_norm = bw.norm();
-      const size_t map_sz  = ioctree_.size();
-
-      // 与 wheel_odom 的短期分裂指标 (在 base_link 系下比, 跟 first-frame 日志一致)
-      double dwheel = -1.0;
-      {
-        std::lock_guard<std::mutex> lk(mtx_wheel_odom_);
-        if (wheel_odom_received_) {
-          Eigen::Isometry3d T_M_I_now = Eigen::Isometry3d::Identity();
-          T_M_I_now.translation() = p;
-          T_M_I_now.linear() = state_.quat().toRotationMatrix();
-          Eigen::Isometry3d T_M_B_now = T_M_I_now * cfg.sensors.extrinsics.imu2baselink.inverse();
-          dwheel = std::hypot(
-              T_M_B_now.translation().x() - latest_wheel_odom_.pose.pose.position.x,
-              T_M_B_now.translation().y() - latest_wheel_odom_.pose.pose.position.y);
-        }
-      }
-
-      ROS_INFO_THROTTLE(5.0,
-          "[LIMO][health] p=[%.2f %.2f %.2f] |p|=%.2f |v|=%.3f |b_a|=%.3f |b_w|=%.4f "
-          "Δwheel=%.3fm map=%zu stop_update=%d",
-          p.x(), p.y(), p.z(), p_norm, v_norm, ba_norm, bw_norm,
-          dwheel, map_sz, (int)stop_ioctree_update_);
-
-      // 发散阈值 (与 /memories/repo/limoncello_failure_modes.md "情况 B" 经验相关)
-      //   p_norm > 100m : 一般室内场景几乎不可能
-      //   v_norm > 5m/s: AGV 物理上限
-      //   b_a > 5 m/s²  : 远超合理 IMU 零偏量级 (典型 < 0.5)
-      //   b_w > 0.5 rad/s: 同上 (典型 < 0.05)
-      //   Δwheel > 5m   : LIMOncello 与 wheel_odom 长期分裂
-      if (p_norm  > 100.0) ROS_WARN_THROTTLE(1.0, "[LIMO][diverge] state.p large: |p|=%.2f → likely diverging", p_norm);
-      if (v_norm  >   5.0) ROS_WARN_THROTTLE(1.0, "[LIMO][diverge] state.v abnormal: |v|=%.3f", v_norm);
-      if (ba_norm >   5.0) ROS_WARN_THROTTLE(1.0, "[LIMO][diverge] accel bias abnormal: |b_a|=%.3f", ba_norm);
-      if (bw_norm >   0.5) ROS_WARN_THROTTLE(1.0, "[LIMO][diverge] gyro  bias abnormal: |b_w|=%.4f", bw_norm);
-      if (dwheel  >   5.0) ROS_WARN_THROTTLE(1.0, "[LIMO][diverge] LIMOncello vs wheel diverged: Δwheel=%.2fm", dwheel);
-    }
-  }
-
-
-  void wheel_odom_callback(const nav_msgs::Odometry::ConstPtr& msg) {
-    std::lock_guard<std::mutex> lk(mtx_wheel_odom_);
-    latest_wheel_odom_ = *msg;
-    wheel_odom_received_ = true;
   }
 
 
@@ -407,159 +289,6 @@ public:
       stop_ioctree_update_ = msg->data;
       ROS_INFO("Stopping ioctree updates from now onwards");
     }
-  }
-
-
-  // /initialpose 重定位回调
-  //
-  // 完整动作 (执行顺序, 全部在同一 mtx_state_ + mtx_buffer_ 临界区内):
-  //   1. 用 wheel odom 的当前位姿重置 state (p, quat), 速度清零
-  //      → 保证从一个合理的物理位置重建地图
-  //   2. 重置 b_a/b_w/g 回 yaml 默认值
-  //      → 发散态下 bias 已被推到非物理值, 不重置则下一帧 IMU predict 立即把 state 推飞
-  //      → 这是 "重定位后跑飞" 的最致命根因
-  //   3. 清空 iOctree (state 飞了的时候点云被变换到 ~1e7 量级位置, octree 已污染)
-  //   4. 重置 P (放大 100, 让 IESKF 前几帧高度信任 LiDAR)
-  //   5. 清空 state_buffer_ + push 一个 dummy state(stamp=now), 避免 lidar_callback
-  //      读 front() 时遇空 circular_buffer 触发 UB
-  //   6. 置 relocalizing_after_clear_ 标志, 用于第一帧诊断
-  //
-  // 前提 (运维侧保证, 不在代码中做门控): 重定位时机器人静止
-  void initialpose_callback(
-      const geometry_msgs::PoseWithCovarianceStamped::ConstPtr& msg)
-  {
-    auto t_start = ros::WallTime::now();
-    Config& cfg = Config::getInstance();
-
-    // ---------- Step 0: 取 wheel_odom 快照 + 入口日志 ----------
-    bool has_wheel = false;
-    double wh_x = 0, wh_y = 0, wh_yaw = 0;
-    double wh_age = -1.0;
-    double wh_vx = 0, wh_wz = 0;
-    {
-      std::lock_guard<std::mutex> lk(mtx_wheel_odom_);
-      if (wheel_odom_received_) {
-        has_wheel = true;
-        wh_x = latest_wheel_odom_.pose.pose.position.x;
-        wh_y = latest_wheel_odom_.pose.pose.position.y;
-        const auto& oq = latest_wheel_odom_.pose.pose.orientation;
-        wh_yaw = std::atan2(2.0*(oq.w*oq.z + oq.x*oq.y),
-                            1.0 - 2.0*(oq.y*oq.y + oq.z*oq.z));
-        wh_vx = latest_wheel_odom_.twist.twist.linear.x;
-        wh_wz = latest_wheel_odom_.twist.twist.angular.z;
-        wh_age = (ros::Time::now() - latest_wheel_odom_.header.stamp).toSec();
-      }
-    }
-
-    // 入口日志
-    ROS_WARN("[LIMO][relocalize] ENTER /initialpose target=(%.3f, %.3f) frame=%s | "
-             "wheel_odom: %s age=%.3fs (x=%.3f y=%.3f yaw=%.2fdeg vx=%.3f wz=%.3f)",
-             msg->pose.pose.position.x, msg->pose.pose.position.y,
-             msg->header.frame_id.c_str(),
-             has_wheel ? "YES" : "NO",
-             wh_age, wh_x, wh_y, wh_yaw * 180.0 / M_PI, wh_vx, wh_wz);
-
-    // 运维提醒: 不做硬门控, 但若检测到运动则提示, 方便排查
-    if (has_wheel and (std::abs(wh_vx) > 0.05 or std::abs(wh_wz) > 0.05)) {
-      ROS_WARN("[LIMO][relocalize] robot NOT stationary at reloc (vx=%.3f wz=%.3f), "
-               "recovery may degrade. Recommend stopping before /initialpose.",
-               wh_vx, wh_wz);
-    }
-
-    // ---------- Step 1-5: reset (持 mtx_state_ + mtx_buffer_, 顺序固定避免死锁) ----------
-    Eigen::Vector3d old_p, old_v, old_ba, old_bw, old_g;
-    Eigen::Quaterniond old_q;
-    Eigen::Vector3d new_p, new_v, new_ba, new_bw, new_g;
-    Eigen::Quaterniond new_q;
-    double imu_stamp_used = 0.0;
-
-    std::lock(mtx_state_, mtx_buffer_);
-    std::lock_guard<std::mutex> lk_s(mtx_state_, std::adopt_lock);
-    std::lock_guard<std::mutex> lk_b(mtx_buffer_, std::adopt_lock);
-
-      // 1) 记录 BEFORE
-      old_p  = state_.p();
-      old_v  = state_.v();
-      old_q  = state_.quat();
-      old_ba = state_.b_a();
-      old_bw = state_.b_w();
-      old_g  = state_.g();
-
-      // 2) 重置位姿 + 速度
-      if (has_wheel) {
-        // 用 wheel odom 的 2D 位姿重置 state (Z=0, roll/pitch=0; bias 重置后 g 对齐会处理倾角)
-        Eigen::Isometry3d T_M_B = Eigen::Isometry3d::Identity();
-        T_M_B.translation() = Eigen::Vector3d(wh_x, wh_y, 0.0);
-        T_M_B.linear() = Eigen::AngleAxisd(wh_yaw, Eigen::Vector3d::UnitZ()).toRotationMatrix();
-        // state 存的是 IMU 帧位姿, 需要 T_M_I = T_M_B * T_B_I
-        Eigen::Isometry3d T_M_I = T_M_B * cfg.sensors.extrinsics.imu2baselink;
-
-        state_.p(T_M_I.translation());
-        state_.quat(Eigen::Quaterniond(T_M_I.linear()).normalized());
-        state_.v(Eigen::Vector3d::Zero());
-      } else {
-        // wheel odom 还没收到, 只能把速度清零, 位置不动
-        state_.v(Eigen::Vector3d::Zero());
-        ROS_WARN("[LIMO][relocalize] no wheel_odom yet, position NOT reset (v=0 only)");
-      }
-
-      // 3) 【关键】重置 bias 和 g 回 yaml 默认值
-      //    出错场景下 bias 已发散; 不重置则下一帧 predict 立即再飞
-      state_.b_w(cfg.sensors.intrinsics.gyro_bias);
-      state_.b_a(cfg.sensors.intrinsics.accel_bias);
-      state_.g(Eigen::Vector3d::UnitZ() * cfg.sensors.extrinsics.gravity);
-
-      // 4) 重置协方差 (×100 而非 ×1000, 配合第一帧 skip update 已足够让 IESKF 高信任 LiDAR)
-      constexpr double P_RELOC_GAIN = 100.0;
-      state_.P.setIdentity();
-      state_.P *= cfg.ikfom.covariance.initial_cov * P_RELOC_GAIN;
-
-      // 5) 清地图 + 清 buffer
-      ioctree_.clear();
-      state_buffer_.clear();
-
-      //    push 一个 dummy state 防 lidar_callback front() 读空 UB
-      //    stamp=now, 这样 lidar_callback 的 `front().stamp >= end_scan` 检查会立即通过
-      state_.stamp = ros::Time::now().toSec();
-      imu_stamp_used = state_.stamp;
-      state_buffer_.push_front(state_);
-
-      // 6) 标记: 下一帧 LiDAR 触发首帧诊断日志
-      relocalizing_after_clear_.store(true);
-      last_initialpose_time_ = ros::Time::now();
-
-      // 同临界区取 AFTER (旧实现是 unlock 后再 lock 二次读, 值可能已被 lidar_callback 改写)
-      new_p  = state_.p();
-      new_v  = state_.v();
-      new_q  = state_.quat();
-      new_ba = state_.b_a();
-      new_bw = state_.b_w();
-      new_g  = state_.g();
-
-    // 释放锁 (lk_s/lk_b 析构)
-
-    // ---------- 完整诊断日志 ----------
-    double dt_ms = (ros::WallTime::now() - t_start).toSec() * 1000.0;
-    ROS_WARN("[LIMO][relocalize] DONE in %.1fms\n"
-             "  BEFORE p=[%.3f %.3f %.3f] v=[%.3f %.3f %.3f] |v|=%.3f "
-             "|b_a|=%.3f |b_w|=%.4f |g|=%.3f q=[w=%.4f xyz=(%.4f %.4f %.4f)]\n"
-             "  AFTER  p=[%.3f %.3f %.3f] v=[%.3f %.3f %.3f] |v|=%.3f "
-             "|b_a|=%.3f |b_w|=%.4f |g|=%.3f q=[w=%.4f xyz=(%.4f %.4f %.4f)]\n"
-             "  wheel=%s (x=%.3f y=%.3f yaw=%.2fdeg) | P*=%.1f | buffer pushed dummy@%.6f | "
-             "ioctree CLEARED | relocalizing_after_clear_=true",
-             dt_ms,
-             old_p.x(), old_p.y(), old_p.z(),
-             old_v.x(), old_v.y(), old_v.z(), old_v.norm(),
-             old_ba.norm(), old_bw.norm(), old_g.norm(),
-             old_q.w(), old_q.x(), old_q.y(), old_q.z(),
-             new_p.x(), new_p.y(), new_p.z(),
-             new_v.x(), new_v.y(), new_v.z(), new_v.norm(),
-             new_ba.norm(), new_bw.norm(), new_g.norm(),
-             new_q.w(), new_q.x(), new_q.y(), new_q.z(),
-             has_wheel ? "YES" : "NO",
-             wh_x, wh_y, wh_yaw * 180.0 / M_PI,
-             cfg.ikfom.covariance.initial_cov * P_RELOC_GAIN,
-             imu_stamp_used);
   }
 
 };

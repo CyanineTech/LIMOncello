@@ -18,7 +18,6 @@ struct Config {
 
 	bool verbose;
 	bool debug;
-	bool health_monitor;
 
   struct Topics {
   	struct {
