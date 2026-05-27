@@ -12,6 +12,7 @@ topics:
 verbose: false          # print debug/performance board
 debug: false            # fill useful intermediate pcl (deskewed, processed ...) 
                         # for visualizing purposes
+publish_tf: false       # disable TF broadcasting (handled by odom_fusion)
 
 sensors:
   lidar:

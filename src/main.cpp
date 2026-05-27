@@ -153,7 +153,8 @@ public:
 
       // 以 IMU 频率(~200Hz)发布里程计和 TF, 是系统的高频位姿输出
       pub_state_.publish(toROS(state_, imu.stamp));
-      publishTFs(state_, br, imu.stamp);
+      if (Config::getInstance().publish_tf)
+        publishTFs(state_, br, imu.stamp);
     }
   }
 

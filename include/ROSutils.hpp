@@ -153,6 +153,7 @@ void fill_config(Config& cfg, ros::NodeHandle& nh) {
 
   nh.getParam("verbose", cfg.verbose);
   nh.getParam("debug",   cfg.debug);
+  nh.param("publish_tf", cfg.publish_tf, true);
 
   // TOPICS
   nh.getParam("topics/input/lidar",               cfg.topics.input.lidar);

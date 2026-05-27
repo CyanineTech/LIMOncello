@@ -18,6 +18,7 @@ struct Config {
 
 	bool verbose;
 	bool debug;
+	bool publish_tf = true;
 
   struct Topics {
   	struct {
