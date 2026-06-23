@@ -1,3 +1,6 @@
+#include <atomic>
+#include <cmath>
+#include <cstdint>
 #include <mutex>
 #include <condition_variable>
 
@@ -9,6 +12,7 @@
 #include <sensor_msgs/Imu.h>
 #include <sensor_msgs/PointCloud2.h>
 #include <std_msgs/Bool.h>
+#include <std_msgs/Header.h>
 #include <nav_msgs/Odometry.h>
 
 
@@ -32,29 +36,53 @@ class Manager {
 
   std::mutex mtx_state_;
   std::mutex mtx_buffer_;
+  std::mutex mtx_map_;
+  std::mutex mtx_wheel_odom_;
 
   std::condition_variable cv_prop_stamp_;
 
   charlie::Octree ioctree_;
   bool stop_ioctree_update_;
+  bool reset_imu_integration_;
+  std::atomic<uint64_t> reset_generation_;
+  double reset_wheel_odom_timeout_;
+
+  nav_msgs::Odometry latest_wheel_odom_;
+  bool wheel_odom_received_;
+  Eigen::Vector3d reset_gyro_bias_;
+  Eigen::Vector3d reset_accel_bias_;
 
   ros::Publisher pub_state_, 
                  pub_frame_,
                  pub_raw_, 
                  pub_deskewed_, 
                  pub_downsampled_, 
-                 pub_filtered_;
+                 pub_filtered_,
+                 reset_done_pub_;
+
+  ros::Subscriber reset_sub_;
+  ros::Subscriber wheel_odom_sub_;
 
   tf2_ros::TransformBroadcaster br;
 
+  static double yawFromQuat(const geometry_msgs::Quaternion& q) {
+    return std::atan2(2.0 * (q.w * q.z + q.x * q.y),
+                      1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+  }
 
 public:
   Manager(ros::NodeHandle& nh) : first_imu_stamp_(-1.0), 
                                  state_buffer_(1000), 
                                  stop_ioctree_update_(false),
+                                 reset_imu_integration_(false),
+                                 reset_generation_(0),
+                                 reset_wheel_odom_timeout_(0.5),
+                                 wheel_odom_received_(false),
                                  ioctree_() {
 
     Config& cfg = Config::getInstance();
+    reset_gyro_bias_ = cfg.sensors.intrinsics.gyro_bias;
+    reset_accel_bias_ = cfg.sensors.intrinsics.accel_bias;
 
     imu_calibrated_ = not (cfg.sensors.calibration.gravity_align
                            or cfg.sensors.calibration.accel
@@ -74,6 +102,13 @@ public:
     pub_deskewed_    = nh.advertise<sensor_msgs::PointCloud2>("debug/deskewed",    10);
     pub_downsampled_ = nh.advertise<sensor_msgs::PointCloud2>("debug/downsampled", 10);
     pub_filtered_    = nh.advertise<sensor_msgs::PointCloud2>("debug/filtered",    10);
+
+    reset_done_pub_ = nh.advertise<std_msgs::Header>("/limoncello/reset_done", 10);
+    nh.param("reset_wheel_odom_timeout", reset_wheel_odom_timeout_, 0.5);
+    reset_sub_ = nh.subscribe("/limoncello/reset_pose", 10,
+        &Manager::reset_callback, this);
+    wheel_odom_sub_ = nh.subscribe("/odom_wheel", 50,
+        &Manager::wheel_odom_callback, this, ros::TransportHints().tcpNoDelay());
   };
   
   ~Manager() = default;
@@ -122,11 +157,16 @@ public:
         if (cfg.sensors.calibration.accel)
           state_.b_a(accel_avg - state_.R().transpose()*state_.g());
 
+        reset_gyro_bias_ = state_.b_w();
+        reset_accel_bias_ = state_.b_a();
+
         prev_imu_ = imu;  // 初始化 prev_imu_，避免下一帧 dt 计算异常
         imu_calibrated_ = true;
       }
 
     } else {
+      State state_snapshot;
+      bool reset_sample = false;
       double dt = imu.stamp - prev_imu_.stamp;
 
       if (dt < 0)
@@ -138,38 +178,52 @@ public:
       // Correct acceleration
       //校正加速度计的系统误差:这里只是用简单的比例因子做的矫正
       imu.lin_accel = cfg.sensors.intrinsics.sm * imu.lin_accel;
-      prev_imu_ = imu;
 
       //用校准后的 IMU 数据预测状态,并将预测结果存入缓冲区,供 LiDAR 回调使用 (位置,速度,姿态等)
       mtx_state_.lock();
+      if (reset_imu_integration_) {
+        prev_imu_ = imu;
+        state_.stamp = imu.stamp;
+        reset_imu_integration_ = false;
+        reset_sample = true;
+      } else {
+        prev_imu_ = imu;
         state_.predict(imu, dt);
+      }
+        state_snapshot = state_;
       mtx_state_.unlock();
 
       mtx_buffer_.lock();
-        state_buffer_.push_front(state_);
+        state_buffer_.push_front(state_snapshot);
       mtx_buffer_.unlock();
 
       cv_prop_stamp_.notify_one();
 
       // 以 IMU 频率(~200Hz)发布里程计和 TF, 是系统的高频位姿输出
-      pub_state_.publish(toROS(state_, imu.stamp));
+      if (reset_sample)
+        ROS_INFO("[LIMO][reset] IMU integration restarted at %.6f", imu.stamp);
+      pub_state_.publish(toROS(state_snapshot, imu.stamp));
       if (Config::getInstance().publish_tf)
-        publishTFs(state_, br, imu.stamp);
+        publishTFs(state_snapshot, br, imu.stamp);
     }
   }
 
 
   void lidar_callback(const sensor_msgs::PointCloud2::ConstPtr& msg) {
     Config& cfg = Config::getInstance();
+    const uint64_t generation_at_start = reset_generation_.load();
 
     //检查IMU数据是否完成校准,如果没有校准完成,则不处理 LiDAR 数据,避免使用不可靠的状态预测结果
     if (not imu_calibrated_)
       return;
     
     //检查是否收到处理后的IMU数据
-    if (state_buffer_.empty()) {
-      ROS_ERROR("[LIMONCELLO] No IMUs received");
-      return;
+    {
+      std::lock_guard<std::mutex> lk(mtx_buffer_);
+      if (state_buffer_.empty()) {
+        ROS_ERROR("[LIMONCELLO] No IMUs received");
+        return;
+      }
     }
     
     // 原始点云数据结构: PointCloudT 通常是 pcl::PointCloud<PointT>,
@@ -193,7 +247,12 @@ public:
     //只有在实际观测到 IMU/点云存在稳定时延时,才建议开启该选项做粗略补偿。
     double offset = 0.0;
     if (cfg.sensors.time_offset) { // automatic sync (not precise!)
-      offset = state_.stamp - point_time(raw->points.back(), sweep_time) - 1.e-4; 
+      double state_stamp = 0.0;
+      {
+        std::lock_guard<std::mutex> lk(mtx_state_);
+        state_stamp = state_.stamp;
+      }
+      offset = state_stamp - point_time(raw->points.back(), sweep_time) - 1.e-4;
       if (offset > 0.0) offset = 0.0; // don't jump into future
     }
 
@@ -205,16 +264,21 @@ public:
     // 如果状态缓冲区里最新可用状态的时间 still 早于本帧点云结束时间,
     // 说明 IMU/传播线程还没有把状态推到这帧扫描结束位置,
     // 此时先阻塞等待,直到 buffer 覆盖到 end_stamp 为止。
-    if (state_buffer_.front().stamp < end_stamp) {
-      double initial_gap_ms = (end_stamp - state_buffer_.front().stamp) * 1000.0;
+    double latest_buffer_stamp = 0.0;
+    {
+      std::lock_guard<std::mutex> lk(mtx_buffer_);
+      latest_buffer_stamp = state_buffer_.front().stamp;
+    }
+    if (latest_buffer_stamp < end_stamp) {
+      double initial_gap_ms = (end_stamp - latest_buffer_stamp) * 1000.0;
       ROS_DEBUG_THROTTLE(2.0, "[LIMONCELLO] Propagate waiting: buffer=%.6f end_scan=%.6f gap=%.3fms",
-                         state_buffer_.front().stamp, end_stamp, initial_gap_ms);
+                         latest_buffer_stamp, end_stamp, initial_gap_ms);
 
       auto t_wait_start = ros::WallTime::now();
       std::unique_lock<decltype(mtx_buffer_)> lock(mtx_buffer_);
       // 等待状态数据准备好。
       cv_prop_stamp_.wait(lock, [this, &end_stamp] { 
-          return state_buffer_.front().stamp >= end_stamp;
+          return !state_buffer_.empty() && state_buffer_.front().stamp >= end_stamp;
       });
       double wait_ms = (ros::WallTime::now() - t_wait_start).toSec() * 1000.0;
       if (wait_ms > 200.0) {
@@ -230,12 +294,16 @@ public:
   mtx_buffer_.unlock();
 
     //插值检查
-    if (start_stamp < interpolated.front().stamp or interpolated.size() == 0) {
+    if (interpolated.size() == 0 or start_stamp < interpolated.front().stamp) {
       // every point needs to have a state associated not in the past
       ROS_WARN("Not enough interpolated states for deskewing pointcloud \n");
       return;
     }
 
+    if (generation_at_start != reset_generation_.load())
+      return;
+
+    State state_after_update;
   mtx_state_.lock();//加锁:防止IMU回调同时修改state_ 
 
     //去畸变: 把每个点从它被采集时的局部坐标系，统一变换到当前帧结束时的坐标系。
@@ -253,9 +321,13 @@ public:
     }
 
     // IESKF 观测更新: 用点云与地图匹配, 迭代修正位姿/bias/重力
-    state_.update(filtered, ioctree_);
+    {
+      std::lock_guard<std::mutex> lk_map(mtx_map_);
+      state_.update(filtered, ioctree_);
+    }
 
     Eigen::Isometry3f T = (state_.isometry() * state_.L2I_isometry()).cast<float>();
+    state_after_update = state_;
 
   mtx_state_.unlock();
 
@@ -266,7 +338,10 @@ public:
     pcl::transformPointCloud(*filtered, *to_save, T);
 
     // Publish
-    pub_state_.publish(toROS(state_, sweep_time));
+    if (generation_at_start != reset_generation_.load())
+      return;
+
+    pub_state_.publish(toROS(state_after_update, sweep_time));
     pub_frame_.publish(toROS(global, sweep_time));
 
     if (cfg.debug) {
@@ -277,11 +352,120 @@ public:
     }
 
     // Update map: 将当前帧的点云（已经去畸变、滤波、变换到全局坐标系）加入地图的八叉树结构中, 以供后续帧的匹配使用。
-    if (not stop_ioctree_update_)
+    if (not stop_ioctree_update_ && generation_at_start == reset_generation_.load()) {
+      std::lock_guard<std::mutex> lk_map(mtx_map_);
       ioctree_.update(to_save->points);
+    }
 
     if (cfg.verbose)
       PROFC_PRINT()
+  }
+
+  //保存最近一次收到的 /odom_wheel 消息, 用于在 /limoncello/reset_pose 时获取车轮里程计的位姿信息
+  void wheel_odom_callback(const nav_msgs::Odometry::ConstPtr& msg) {
+    std::lock_guard<std::mutex> lk(mtx_wheel_odom_);
+    latest_wheel_odom_ = *msg;
+    wheel_odom_received_ = true;
+  }
+
+
+  void reset_callback(const std_msgs::Header::ConstPtr& msg) {
+    Config& cfg = Config::getInstance();
+    const ros::Time request_stamp = msg->stamp.isZero() ? ros::Time::now() : msg->stamp;
+
+    bool wheel_seen = false;
+    bool has_wheel = false;
+    double wheel_x = 0.0, wheel_y = 0.0, wheel_yaw = 0.0;
+    double wheel_age = -1.0, wheel_vx = 0.0, wheel_wz = 0.0;
+    {
+      std::lock_guard<std::mutex> lk(mtx_wheel_odom_);
+      //读取最近一次收到的 /odom_wheel 消息
+      if (wheel_odom_received_) {
+        wheel_seen = true;
+        wheel_x = latest_wheel_odom_.pose.pose.position.x;
+        wheel_y = latest_wheel_odom_.pose.pose.position.y;
+        wheel_yaw = yawFromQuat(latest_wheel_odom_.pose.pose.orientation);
+        wheel_vx = latest_wheel_odom_.twist.twist.linear.x;
+        wheel_wz = latest_wheel_odom_.twist.twist.angular.z;
+        //检查 /odom_wheel 的时间戳是否过期, 如果过期则认为没有可用的车轮里程计数据
+        if (latest_wheel_odom_.header.stamp.isZero()) {
+          wheel_age = 0.0;
+          has_wheel = true;
+        } else {
+          wheel_age = (ros::Time::now() - latest_wheel_odom_.header.stamp).toSec();
+          has_wheel = std::abs(wheel_age) <= reset_wheel_odom_timeout_;
+        }
+      }
+    }
+
+    const char* wheel_status = has_wheel ? "FRESH" : (wheel_seen ? "STALE" : "NO");
+    ROS_WARN("[LIMO][reset] request stamp=%.6f wheel=%s age=%.3fs timeout=%.3fs pose=(%.3f %.3f %.2fdeg) vx=%.3f wz=%.3f",
+             request_stamp.toSec(), wheel_status, wheel_age, reset_wheel_odom_timeout_,
+             wheel_x, wheel_y, wheel_yaw * 180.0 / M_PI, wheel_vx, wheel_wz);
+
+    Eigen::Vector3d old_p, old_v, new_p, new_v;
+    Eigen::Quaterniond old_q, new_q;
+    size_t old_map_size = 0;
+
+    std_msgs::Header done;
+    done.stamp = request_stamp;
+    done.frame_id = has_wheel ? "ok" : (wheel_seen ? "stale_wheel_pose" : "no_wheel_pose");
+
+    {
+      std::lock(mtx_state_, mtx_buffer_, mtx_map_);
+      std::lock_guard<std::mutex> lk_state(mtx_state_, std::adopt_lock);
+      std::lock_guard<std::mutex> lk_buffer(mtx_buffer_, std::adopt_lock);
+      std::lock_guard<std::mutex> lk_map(mtx_map_, std::adopt_lock);
+
+      old_p = state_.p();
+      old_v = state_.v();
+      old_q = state_.quat();
+      old_map_size = ioctree_.size();
+
+      if (has_wheel) {
+        Eigen::Isometry3d T_O_B = Eigen::Isometry3d::Identity();
+        T_O_B.translation() = Eigen::Vector3d(wheel_x, wheel_y, 0.0);
+        T_O_B.linear() = Eigen::AngleAxisd(wheel_yaw, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+
+        // State stores odom_limoncello -> IMU. The config matrix is base_link -> IMU.
+        Eigen::Isometry3d T_O_I = T_O_B * cfg.sensors.extrinsics.imu2baselink;
+        state_.p(T_O_I.translation());
+        state_.quat(Eigen::Quaterniond(T_O_I.linear()).normalized());
+      } else {
+        ROS_WARN("[LIMO][reset] no fresh /odom_wheel; keeping current position and only resetting velocity/map/filter state");
+      }
+
+      state_.v(Eigen::Vector3d::Zero());
+      state_.b_w(reset_gyro_bias_);
+      state_.b_a(reset_accel_bias_);
+      state_.g(Eigen::Vector3d::UnitZ() * cfg.sensors.extrinsics.gravity);
+      state_.P.setIdentity();
+      state_.P *= cfg.ikfom.covariance.initial_cov * 100.0;
+      state_.stamp = request_stamp.toSec();
+
+      ioctree_.clear();
+      state_buffer_.clear();
+      state_buffer_.push_front(state_);
+      reset_imu_integration_ = true;
+      reset_generation_.fetch_add(1);
+
+      new_p = state_.p();
+      new_v = state_.v();
+      new_q = state_.quat();
+    }
+
+    cv_prop_stamp_.notify_all();
+    reset_done_pub_.publish(done);
+
+    // 打印重置前后的状态信息, 方便调试和验证
+    ROS_WARN("[LIMO][reset] done stamp=%.6f map_points=%zu->0\n"
+             "  before p=[%.3f %.3f %.3f] v=[%.3f %.3f %.3f] q=[%.4f %.4f %.4f %.4f]\n"
+             "  after  p=[%.3f %.3f %.3f] v=[%.3f %.3f %.3f] q=[%.4f %.4f %.4f %.4f]",
+             request_stamp.toSec(), old_map_size,
+             old_p.x(), old_p.y(), old_p.z(), old_v.x(), old_v.y(), old_v.z(),
+             old_q.w(), old_q.x(), old_q.y(), old_q.z(),
+             new_p.x(), new_p.y(), new_p.z(), new_v.x(), new_v.y(), new_v.z(),
+             new_q.w(), new_q.x(), new_q.y(), new_q.z());
   }
 
 
@@ -342,4 +526,3 @@ int main(int argc, char** argv) {
 
   return 0;
 }
-

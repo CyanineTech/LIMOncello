@@ -6,13 +6,14 @@ topics:
   output:
     state: /limoncello/odom     
     frame: /limoncello/map_pcl   
-  frame_id: odom_limo      
+  frame_id: odom_limoncello
 
 
 verbose: false          # print debug/performance board
 debug: false            # fill useful intermediate pcl (deskewed, processed ...) 
                         # for visualizing purposes
 publish_tf: false       # disable TF broadcasting (handled by odom_fusion)
+reset_wheel_odom_timeout: 0.5  # seconds; /odom_wheel must be this fresh for internal reset
 
 sensors:
   lidar:
