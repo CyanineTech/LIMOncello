@@ -42,9 +42,10 @@ struct Config {
   		bool end_of_sweep;
   	} lidar;
 
-  	struct {
-  		int hz;
-  	} imu;
+    struct {
+      int hz;
+      double accel_scale = 1.0;
+    } imu;
 
   	struct {
   		bool gravity_align;
@@ -143,4 +144,3 @@ struct Config {
   Config(Config&&) = delete;
   Config& operator=(Config&&) = delete;
 };
-

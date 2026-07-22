@@ -168,6 +168,7 @@ void fill_config(Config& cfg, ros::NodeHandle& nh) {
   nh.getParam("sensors/lidar/type",         cfg.sensors.lidar.type);
   nh.getParam("sensors/lidar/end_of_sweep", cfg.sensors.lidar.end_of_sweep);
   nh.getParam("sensors/imu/hz",             cfg.sensors.imu.hz);
+  nh.param("sensors/imu/accel_scale",        cfg.sensors.imu.accel_scale, 1.0);
 
   nh.getParam("sensors/calibration/gravity_align", cfg.sensors.calibration.gravity_align);
   nh.getParam("sensors/calibration/accel",         cfg.sensors.calibration.accel);

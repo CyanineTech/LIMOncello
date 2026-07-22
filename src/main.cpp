@@ -1,8 +1,10 @@
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <mutex>
 #include <condition_variable>
+#include <string>
 
 #include <Eigen/Dense>
 
@@ -38,6 +40,7 @@ class Manager {
   std::mutex mtx_buffer_;
   std::mutex mtx_map_;
   std::mutex mtx_wheel_odom_;
+  std::mutex mtx_reset_anchor_odom_;
 
   std::condition_variable cv_prop_stamp_;
 
@@ -46,9 +49,16 @@ class Manager {
   bool reset_imu_integration_;
   std::atomic<uint64_t> reset_generation_;
   double reset_wheel_odom_timeout_;
+  double reset_anchor_odom_timeout_;
+  std::string reset_anchor_odom_topic_;
+  int reset_map_warmup_frames_;
+  int reset_map_warmup_remaining_;
+  State reset_anchor_state_;
 
   nav_msgs::Odometry latest_wheel_odom_;
   bool wheel_odom_received_;
+  nav_msgs::Odometry latest_reset_anchor_odom_;
+  bool reset_anchor_odom_received_;
   Eigen::Vector3d reset_gyro_bias_;
   Eigen::Vector3d reset_accel_bias_;
 
@@ -62,6 +72,7 @@ class Manager {
 
   ros::Subscriber reset_sub_;
   ros::Subscriber wheel_odom_sub_;
+  ros::Subscriber reset_anchor_odom_sub_;
 
   tf2_ros::TransformBroadcaster br;
 
@@ -77,7 +88,12 @@ public:
                                  reset_imu_integration_(false),
                                  reset_generation_(0),
                                  reset_wheel_odom_timeout_(0.5),
+                                 reset_anchor_odom_timeout_(0.5),
+                                 reset_anchor_odom_topic_("/odom"),
+                                 reset_map_warmup_frames_(10),
+                                 reset_map_warmup_remaining_(0),
                                  wheel_odom_received_(false),
+                                 reset_anchor_odom_received_(false),
                                  ioctree_() {
 
     Config& cfg = Config::getInstance();
@@ -105,10 +121,17 @@ public:
 
     reset_done_pub_ = nh.advertise<std_msgs::Header>("/limoncello/reset_done", 10);
     nh.param("reset_wheel_odom_timeout", reset_wheel_odom_timeout_, 0.5);
+    nh.param<std::string>("reset_anchor_odom_topic", reset_anchor_odom_topic_, "/odom");
+    nh.param("reset_anchor_odom_timeout", reset_anchor_odom_timeout_, 0.5);
+    nh.param("reset_map_warmup_frames", reset_map_warmup_frames_, 10);
+    reset_map_warmup_frames_ = std::max(0, reset_map_warmup_frames_);
     reset_sub_ = nh.subscribe("/limoncello/reset_pose", 10,
         &Manager::reset_callback, this);
     wheel_odom_sub_ = nh.subscribe("/odom_wheel", 50,
         &Manager::wheel_odom_callback, this, ros::TransportHints().tcpNoDelay());
+    reset_anchor_odom_sub_ = nh.subscribe(reset_anchor_odom_topic_, 50,
+        &Manager::reset_anchor_odom_callback, this,
+        ros::TransportHints().tcpNoDelay());
   };
   
   ~Manager() = default;
@@ -119,6 +142,9 @@ public:
     Config& cfg = Config::getInstance();
 
     Imu imu = fromROS(msg);
+    // Livox publishes acceleration in g. Convert units before calibration so
+    // calibration, bias estimation and state prediction all use m/s^2.
+    imu.lin_accel *= cfg.sensors.imu.accel_scale;
 
     if (first_imu_stamp_ < 0.)
       first_imu_stamp_ = imu.stamp;
@@ -183,9 +209,20 @@ public:
       mtx_state_.lock();
       if (reset_imu_integration_) {
         prev_imu_ = imu;
+        state_.a = imu.lin_accel;
+        state_.w = imu.ang_vel;
         state_.stamp = imu.stamp;
         reset_imu_integration_ = false;
         reset_sample = true;
+      } else if (reset_map_warmup_remaining_ > 0) {
+        // Relocalization is only allowed while stationary. Keep every state in
+        // the warmup buffer at the reset anchor so the new map cannot inherit
+        // IMU drift before scan matching has a usable local reference.
+        prev_imu_ = imu;
+        state_ = reset_anchor_state_;
+        state_.a = imu.lin_accel;
+        state_.w = imu.ang_vel;
+        state_.stamp = imu.stamp;
       } else {
         prev_imu_ = imu;
         state_.predict(imu, dt);
@@ -320,8 +357,9 @@ public:
       return;
     }
 
-    // IESKF 观测更新: 用点云与地图匹配, 迭代修正位姿/bias/重力
-    {
+    // Build a stable local reference before enabling IESKF after reset.
+    const bool reset_warmup_frame = reset_map_warmup_remaining_ > 0;
+    if (!reset_warmup_frame) {
       std::lock_guard<std::mutex> lk_map(mtx_map_);
       state_.update(filtered, ioctree_);
     }
@@ -352,9 +390,32 @@ public:
     }
 
     // Update map: 将当前帧的点云（已经去畸变、滤波、变换到全局坐标系）加入地图的八叉树结构中, 以供后续帧的匹配使用。
+    bool map_updated = false;
     if (not stop_ioctree_update_ && generation_at_start == reset_generation_.load()) {
       std::lock_guard<std::mutex> lk_map(mtx_map_);
       ioctree_.update(to_save->points);
+      map_updated = true;
+    }
+
+    if (reset_warmup_frame && map_updated) {
+      bool warmup_complete = false;
+      int warmup_remaining = 0;
+      {
+        std::lock_guard<std::mutex> lk_state(mtx_state_);
+        if (generation_at_start == reset_generation_.load()
+            && reset_map_warmup_remaining_ > 0) {
+          --reset_map_warmup_remaining_;
+          warmup_remaining = reset_map_warmup_remaining_;
+          warmup_complete = reset_map_warmup_remaining_ == 0;
+        }
+      }
+      if (warmup_complete) {
+        ROS_WARN("[LIMO][reset] map warmup complete after %d frames; enabling IMU prediction and IESKF updates",
+                 reset_map_warmup_frames_);
+      } else {
+        ROS_DEBUG("[LIMO][reset] map warmup frame inserted; %d remaining",
+                  warmup_remaining);
+      }
     }
 
     if (cfg.verbose)
@@ -368,10 +429,43 @@ public:
     wheel_odom_received_ = true;
   }
 
+  // Keep the fused local odom as the preferred reset anchor. Neo changes the
+  // map->odom transform, not this local odom pose, so using it preserves the
+  // main odom continuity without changing global relocalization behavior.
+  void reset_anchor_odom_callback(const nav_msgs::Odometry::ConstPtr& msg) {
+    std::lock_guard<std::mutex> lk(mtx_reset_anchor_odom_);
+    latest_reset_anchor_odom_ = *msg;
+    reset_anchor_odom_received_ = true;
+  }
+
 
   void reset_callback(const std_msgs::Header::ConstPtr& msg) {
     Config& cfg = Config::getInstance();
     const ros::Time request_stamp = msg->stamp.isZero() ? ros::Time::now() : msg->stamp;
+    const ros::Time now = ros::Time::now();
+
+    bool reset_odom_seen = false;
+    bool has_reset_odom = false;
+    double reset_odom_x = 0.0, reset_odom_y = 0.0, reset_odom_yaw = 0.0;
+    double reset_odom_age = -1.0, reset_odom_vx = 0.0, reset_odom_wz = 0.0;
+    {
+      std::lock_guard<std::mutex> lk(mtx_reset_anchor_odom_);
+      if (reset_anchor_odom_received_) {
+        reset_odom_seen = true;
+        reset_odom_x = latest_reset_anchor_odom_.pose.pose.position.x;
+        reset_odom_y = latest_reset_anchor_odom_.pose.pose.position.y;
+        reset_odom_yaw = yawFromQuat(latest_reset_anchor_odom_.pose.pose.orientation);
+        reset_odom_vx = latest_reset_anchor_odom_.twist.twist.linear.x;
+        reset_odom_wz = latest_reset_anchor_odom_.twist.twist.angular.z;
+        if (latest_reset_anchor_odom_.header.stamp.isZero()) {
+          reset_odom_age = 0.0;
+          has_reset_odom = true;
+        } else {
+          reset_odom_age = (now - latest_reset_anchor_odom_.header.stamp).toSec();
+          has_reset_odom = std::abs(reset_odom_age) <= reset_anchor_odom_timeout_;
+        }
+      }
+    }
 
     bool wheel_seen = false;
     bool has_wheel = false;
@@ -392,15 +486,27 @@ public:
           wheel_age = 0.0;
           has_wheel = true;
         } else {
-          wheel_age = (ros::Time::now() - latest_wheel_odom_.header.stamp).toSec();
+          wheel_age = (now - latest_wheel_odom_.header.stamp).toSec();
           has_wheel = std::abs(wheel_age) <= reset_wheel_odom_timeout_;
         }
       }
     }
 
+    const bool has_anchor = has_reset_odom || has_wheel;
+    const double anchor_x = has_reset_odom ? reset_odom_x : wheel_x;
+    const double anchor_y = has_reset_odom ? reset_odom_y : wheel_y;
+    const double anchor_yaw = has_reset_odom ? reset_odom_yaw : wheel_yaw;
+    const char* anchor_source = has_reset_odom ? "odom" : (has_wheel ? "wheel_fallback" : "current_limo");
+    const char* reset_odom_status = has_reset_odom ? "FRESH" : (reset_odom_seen ? "STALE" : "NO");
     const char* wheel_status = has_wheel ? "FRESH" : (wheel_seen ? "STALE" : "NO");
-    ROS_WARN("[LIMO][reset] request stamp=%.6f wheel=%s age=%.3fs timeout=%.3fs pose=(%.3f %.3f %.2fdeg) vx=%.3f wz=%.3f",
-             request_stamp.toSec(), wheel_status, wheel_age, reset_wheel_odom_timeout_,
+    ROS_WARN("[LIMO][reset] request stamp=%.6f anchor=%s "
+             "odom=%s age=%.3fs timeout=%.3fs pose=(%.3f %.3f %.2fdeg) vx=%.3f wz=%.3f; "
+             "wheel=%s age=%.3fs timeout=%.3fs pose=(%.3f %.3f %.2fdeg) vx=%.3f wz=%.3f",
+             request_stamp.toSec(), anchor_source,
+             reset_odom_status, reset_odom_age, reset_anchor_odom_timeout_,
+             reset_odom_x, reset_odom_y, reset_odom_yaw * 180.0 / M_PI,
+             reset_odom_vx, reset_odom_wz,
+             wheel_status, wheel_age, reset_wheel_odom_timeout_,
              wheel_x, wheel_y, wheel_yaw * 180.0 / M_PI, wheel_vx, wheel_wz);
 
     Eigen::Vector3d old_p, old_v, new_p, new_v;
@@ -409,7 +515,9 @@ public:
 
     std_msgs::Header done;
     done.stamp = request_stamp;
-    done.frame_id = has_wheel ? "ok" : (wheel_seen ? "stale_wheel_pose" : "no_wheel_pose");
+    done.frame_id = has_anchor
+        ? "ok"
+        : ((reset_odom_seen || wheel_seen) ? "stale_reset_anchor" : "no_reset_anchor");
 
     {
       std::lock(mtx_state_, mtx_buffer_, mtx_map_);
@@ -422,17 +530,17 @@ public:
       old_q = state_.quat();
       old_map_size = ioctree_.size();
 
-      if (has_wheel) {
+      if (has_anchor) {
         Eigen::Isometry3d T_O_B = Eigen::Isometry3d::Identity();
-        T_O_B.translation() = Eigen::Vector3d(wheel_x, wheel_y, 0.0);
-        T_O_B.linear() = Eigen::AngleAxisd(wheel_yaw, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+        T_O_B.translation() = Eigen::Vector3d(anchor_x, anchor_y, 0.0);
+        T_O_B.linear() = Eigen::AngleAxisd(anchor_yaw, Eigen::Vector3d::UnitZ()).toRotationMatrix();
 
         // State stores odom_limoncello -> IMU. The config matrix is base_link -> IMU.
         Eigen::Isometry3d T_O_I = T_O_B * cfg.sensors.extrinsics.imu2baselink;
         state_.p(T_O_I.translation());
         state_.quat(Eigen::Quaterniond(T_O_I.linear()).normalized());
       } else {
-        ROS_WARN("[LIMO][reset] no fresh /odom_wheel; keeping current position and only resetting velocity/map/filter state");
+        ROS_WARN("[LIMO][reset] no fresh reset anchor; keeping current LIMO position and only resetting velocity/map/filter state");
       }
 
       state_.v(Eigen::Vector3d::Zero());
@@ -440,8 +548,11 @@ public:
       state_.b_a(reset_accel_bias_);
       state_.g(Eigen::Vector3d::UnitZ() * cfg.sensors.extrinsics.gravity);
       state_.P.setIdentity();
-      state_.P *= cfg.ikfom.covariance.initial_cov * 100.0;
+      state_.P *= cfg.ikfom.covariance.initial_cov;
       state_.stamp = request_stamp.toSec();
+
+      reset_anchor_state_ = state_;
+      reset_map_warmup_remaining_ = reset_map_warmup_frames_;
 
       ioctree_.clear();
       state_buffer_.clear();
@@ -458,10 +569,10 @@ public:
     reset_done_pub_.publish(done);
 
     // 打印重置前后的状态信息, 方便调试和验证
-    ROS_WARN("[LIMO][reset] done stamp=%.6f map_points=%zu->0\n"
+    ROS_WARN("[LIMO][reset] done stamp=%.6f anchor=%s map_points=%zu->0 warmup_frames=%d\n"
              "  before p=[%.3f %.3f %.3f] v=[%.3f %.3f %.3f] q=[%.4f %.4f %.4f %.4f]\n"
              "  after  p=[%.3f %.3f %.3f] v=[%.3f %.3f %.3f] q=[%.4f %.4f %.4f %.4f]",
-             request_stamp.toSec(), old_map_size,
+             request_stamp.toSec(), anchor_source, old_map_size, reset_map_warmup_frames_,
              old_p.x(), old_p.y(), old_p.z(), old_v.x(), old_v.y(), old_v.z(),
              old_q.w(), old_q.x(), old_q.y(), old_q.z(),
              new_p.x(), new_p.y(), new_p.z(), new_v.x(), new_v.y(), new_v.z(),

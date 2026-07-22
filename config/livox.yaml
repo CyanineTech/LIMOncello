@@ -13,7 +13,10 @@ verbose: false          # print debug/performance board
 debug: false            # fill useful intermediate pcl (deskewed, processed ...) 
                         # for visualizing purposes
 publish_tf: false       # disable TF broadcasting (handled by odom_fusion)
+reset_anchor_odom_topic: /odom   # preferred local-pose anchor; Neo only changes map->odom TF
+reset_anchor_odom_timeout: 0.5   # seconds; fall back to /odom_wheel when stale/unavailable
 reset_wheel_odom_timeout: 0.5  # seconds; /odom_wheel must be this fresh for internal reset
+reset_map_warmup_frames: 10    # fixed-pose LiDAR frames used to rebuild the map after reset
 
 sensors:
   lidar:
@@ -22,6 +25,8 @@ sensors:
                         # start or the end of the scan (only applies to VELODYNE/OUSTER)
   imu:
     hz: 200
+    # livox_ros_driver2 publishes acceleration in g; LIMOncello expects m/s^2.
+    accel_scale: 9.80665
 
   calibration:  # automatic IMU calibration (if all set to false, no calibration will be done)
     gravity_align: false           # estimate gravity vector
